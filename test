@@ -1,0 +1,75 @@
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      
+      - name: Download ngrok
+        run: Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
+      
+      - name: Extract ngrok
+        run: Expand-Archive ngrok.zip -DestinationPath .
+      
+      - name: Authenticate ngrok
+        run: .\ngrok.exe config add-authtoken $Env:NGROK_AUTH_TOKEN
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+      
+      - name: Enable RDP
+        run: |
+          # Create user if missing (idempotent-ish)
+          net user runneradmin P@ssw0rd! /add >$null 2>&1 
+          
+          # Add to admins group silently
+          net localgroup administrators runneradmin /add >$null 2>&1
+          
+          # Activate account
+          net user runneradmin /active:yes >$null 2>&1
+          
+          # Open firewall ports quietly
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0 >$null 2>&1
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" >$null 2>&1
+          
+          # Disable UAC prompt requirement for smoother connections
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 >$null 2>&1
+      
+      - name: Start ngrok & Fetch Tunnel URL
+        id: ngrok-tunnel
+        run: |
+          $pid = Start-Process -FilePath .\ngrok.exe -ArgumentList "tcp 3389" -PassThru
+          
+          # Sleep long enough for Windows console apps to settle (~5 seconds)
+          Start-Sleep -Seconds 5
+          
+          # Poll until we actually get JSON data back from the API
+          while ($true) {
+            try {
+              $resp = Invoke-RestMethod http://127.0.0.1:4040/api/tunnels -TimeoutSec 10
+              
+              # Only count as success if we found at least one active tunnel object
+              if ($resp.tunnels.Count -gt 0) { break }
+            } catch { continue }
+          }
+          
+          Write-Host "--- Ngrok Live ---"
+          foreach ($t in $resp.tunnels) {
+            Write-Output "$($t.proto.ToUpper()): $($t.public_url)"
+            
+            # Output variables so other scripts can grab them dynamically
+            echo "::set-output name=URL::$($t.public_url)"
+            echo "::set-output name=TUNNEL_ID::$($t.id)"
+            echo "::set-output name=FWD_PROTO::$($t.proxies[0].proto.ToLower() if ($t.proxies else '') )"
+          }
+        
+        shell: pwsh
+      
+      - name: Display Final Results
+        run: |
+          Get-Content "${{ github.workspace }}/result.txt"
+        working-directory: ./
+
+# Optional: create a placeholder file if you need strictly defined outputs elsewhere
+run: New-Item -ItemType File -Force -Path "./result.txt"
+shell: pwsh
+env:
+  RESULT_FILE: result.txt
